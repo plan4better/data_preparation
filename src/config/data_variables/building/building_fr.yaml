@@ -1,0 +1,90 @@
+region_pbf:
+  [
+    "https://download.geofabrik.de/europe/france/alsace-latest.osm.pbf",
+  "https://download.geofabrik.de/europe/france/champagne-ardenne-latest.osm.pbf",
+  "https://download.geofabrik.de/europe/france/lorraine-latest.osm.pbf"
+  ]
+
+collection:
+  city_gml:
+    path_s3: "300001907_LoD2/lod2/"
+    relevant_s3_files: ["bb.zip", "be.zip", "bw.zip", "by.zip", "hb.zip", "he.zip", "hh.zip", "mv.zip", "ni.zip", "nw.zip", "rp.zip", "sh.zip", "sl.zip", "sn.zip", "st.zip", "th.zip"] 
+    remote_target_schema: "public"
+    remote_target_table: "building_germany"
+    geographical_extent: "SELECT id, gen, ST_ASTEXT(geom) AS geom FROM germany_states"
+    
+  osm_tags:
+    building: ['*']
+  additional_columns:
+    [
+      "amenity",
+      "leisure",
+      "addr:street",
+      "addr:housenumber",
+      "building:levels",
+      "roof:levels",
+    ]
+  nodes: True
+  ways: True
+  relations: False
+
+preparation:
+  schema: "basic"
+  average_building_levels: 2
+  average_roof_levels: 1
+  study_area_ids: [1]
+
+  classification:
+    residential_status:
+      polygon:
+        
+        building_osm:
+          query: "SELECT way AS geom FROM building_osm_fr WHERE amenity IN ('hospital', 'university', 'community_centre', 'school', 'kindergarten', 'recreation_ground', 'wood') OR leisure IN ('zoo')"
+          value: "'no_residents'"
+          share: 0.5
+
+        building_osm2:
+          query: "SELECT way AS geom FROM building_osm_fr WHERE building IN ('apartments', 'bungalow', 'detached', 'dormitory', 'residential', 'house', 'terrace', 'home', 'semidetached_house')"
+          value: "'with_residents'"
+          share: 0.5
+
+      point:
+        poi:
+          query: "SELECT count(*) AS count FROM poi_osm_fr p"
+          value: "'no_residents'"
+          count: 5
+
+      attribute:
+        building_type:
+          with_residents:
+            [
+              'Résidentiel individuel',
+               'Résidentiel collectif',
+               
+              
+            ]
+          no_residents:
+            [
+              'Tertiaire',
+               'Secondaire',
+               'Dépendance', 
+               'Indifférencié'
+            ]
+
+
+
+        # address:
+        #   query: "SELECT count(*) AS count FROM public.ga_germany p"
+        #   db: "foreign"
+        #   value: "'no_residents'"
+        #   count: 0
+
+
+    building_levels_residential:
+      point:
+        poi_osm:
+          query: "SELECT CASE WHEN count(*) > 0 THEN 1 END AS substract FROM osm_poi_fr_point p WHERE (shop IS NOT NULL	OR	amenity IS NOT NULL	OR	office IS NOT NULL) AND ST_Intersects(b.geom, p.way)"
+        polygon:
+          query: "SELECT CASE WHEN count(*) > 0 THEN 1 END AS substract FROM osm_poi_fr_polygon p  WHERE (shop IS NOT NULL	OR	amenity IS NOT NULL	OR	office IS NOT NULL) AND ST_Intersects(b.geom, p.way)"
+        poi:
+          query: "SELECT CASE WHEN count(*) > 0 THEN 1 END AS substract FROM poi_osm_fr p WHERE ST_Intersects(b.geom, p.geom)"

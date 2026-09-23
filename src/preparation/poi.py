@@ -1,8 +1,11 @@
+import json
 import os
+import subprocess
 
 import geopandas as gpd
 import numpy as np
 import polars as pl
+import requests
 
 from src.config.config import Config
 from src.core.config import settings
@@ -12,6 +15,7 @@ from src.preparation.subscription import Subscription
 from src.utils.utils import (
     create_table_dump,
     polars_df_to_postgis,
+    print_error,
     print_info,
     restore_table_dump,
     timing,
@@ -78,13 +82,13 @@ class PoiPreparation:
         column_names = """
         osm_id::bigint, name, brand, "addr:street" AS street, "addr:housenumber" AS housenumber,
         "addr:postcode" AS zipcode, phone, email, website, capacity, opening_hours, wheelchair, operator, origin, organic,
-        subway, amenity, shop, tourism, railway, leisure, sport, highway, public_transport, historic, tags::jsonb AS tags
+        subway, amenity, shop, tourism, railway, leisure, sport, highway, public_transport, historic,building, tags::jsonb AS tags
         """
 
         # Read POIs from database
         sql_query = [
-            f"""SELECT {column_names}, 'n' AS osm_type, ST_ASTEXT(way) AS geom FROM public.osm_poi_{self.region}_point""",
-            f"""SELECT {column_names}, 'w' AS osm_type, ST_ASTEXT(ST_CENTROID(way)) AS geom FROM public.osm_poi_{self.region}_polygon""",
+            f""" SELECT DISTINCT ON (osm_id) {column_names}, 'n' AS osm_type, ST_ASTEXT(way) AS geom FROM public.osm_poi_{self.region}_point""",
+            f"""SELECT DISTINCT ON (osm_id)  {column_names}, 'w' AS osm_type, ST_ASTEXT(ST_CENTROID(way)) AS geom FROM public.osm_poi_{self.region}_polygon""",
         ]
         df = pl.read_database_uri(sql_query, self.db_uri)
         return df
@@ -241,6 +245,7 @@ class PoiPreparation:
 
         arr_names = df_unclassified["name"].to_numpy()
         arr_brands = df_unclassified["brand"].to_numpy()
+        arr_brands = df_unclassified["tags"].to_numpy()
 
         # Check if name or brand is similar
         check_brands = vector_check_string_similarity_bulk(
@@ -262,6 +267,89 @@ class PoiPreparation:
         df = pl.concat([df_unclassified, df_classified], how="diagonal")
         return df, new_column_names
 
+    @timing
+    def classify_by_ai(self, df: pl.DataFrame, poi_config: dict, key: str, specific_instruction: str, new_column_names: list[str], category: str,batch_size: int = 150) -> pl.DataFrame:
+        """Classify POIs using OpenRouter AI."""
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {settings.OPENROUTER_API}",
+            "Content-Type": "application/json",
+        }
+        df_restricted=df[['name', 'operator','website','tags','osm_id']]
+        records = df_restricted.to_dicts()
+        results = []
+        new_column_names.append(key + "___ai")
+        new_column_names.append(category + "___ai")
+        
+
+        def batch_classify(batch):
+            messages = [ {
+                            "role": "system",
+                            "content": (
+                                f"{specific_instruction} For each POI, return ONLY: "
+                                "'osm_id', 'category', 'prob' (probability 0-1 for your confidence that the POI falls in this category). "
+                                "The output format must be one row per POI, as: osm_id: <osm_id>, category: <category>, prob: <prob>. "
+                                "If you are unsure, return osm_id: <osm_id>,  category: unknown and prob: 0."
+                            ),
+                        }
+                    ]
+            for row in batch:
+                poi_info = ", ".join([f"{k}: {row[k]}" for k in row.keys() if row[k] is not None])
+                messages.append({
+                    "role": "user",
+                    "content": f"POI: {poi_info}."
+                })
+        
+            data = {
+                "model": "mistralai/mistral-7b-instruct",
+                "messages": messages
+            }
+           
+            try:
+                response = requests.post(url, headers=headers, data=json.dumps(data), timeout=150)
+                result = response.json()
+                contents = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                contents = contents.replace("<s> [OUT]", "").replace("[/OUT]", "")
+                categories = contents.splitlines()
+                return categories
+            except Exception as e:
+                print_error(f"AI batch classification failed: {e}")
+                return ["unknown: 0"] * len(batch)
+
+            # Process in batches
+        for i in range(0, 150, batch_size):
+            print_info(f"Classifying POIs by AI: Processing batch {i // batch_size + 1}")
+            batch = records[i:i+batch_size]
+            batch_result = batch_classify(batch)
+            for  res in batch_result:
+                parts = {kv.split(":")[0].strip(): kv.split(":", 1)[1].strip() for kv in res.split(",") if ":" in kv}
+                osm_id = int(parts.get("osm_id", -1))
+                category_ai = parts.get("category", "unknown")
+                prob_str = parts.get("prob", "0.0")
+                prob = float(prob_str.split()[0]) if prob_str else 0.0
+                results.append({"osm_id": osm_id, "ai_category": category_ai.strip(), "ai_proba": prob})
+
+        ai_df = pl.DataFrame(results)
+        df = df.join(ai_df, on="osm_id", how="left")
+        # Mark rows where AI probability > 0.5
+        df = df.with_columns(
+            pl.when(pl.col("ai_proba") > 0.5)
+            .then(True)
+            .otherwise(False)
+            .alias(key + "___ai")
+        )
+        # Mark rows to remove where AI probability <= 0.5
+        df = df.with_columns(
+            pl.when(pl.col("ai_proba") <= 0.5)
+            .then(True)
+            .otherwise(False)
+            .alias(category + "___ai")
+        )
+
+        return df, new_column_names
+   
+   
+    
     def classify_by_config(self, df: pl.DataFrame, category: str) -> pl.DataFrame:
         """Classifies POIs by config file.
 
@@ -275,6 +363,20 @@ class PoiPreparation:
 
         # New columns for classification
         new_column_names = []
+        
+
+        config_by_tag = self.config_pois_preparation[category].get("classify_by_ai")
+        if config_by_tag != None:
+            for key in config_by_tag:
+                df, new_column_names = self.classify_by_ai(
+                    df=df,
+                    poi_config=config_by_tag[key],
+                    key=key,
+                    specific_instruction=config_by_tag[key]["specific_instruction"],
+                    new_column_names=new_column_names,
+                    category=category
+                )
+
 
         # Classify by tag
         config_by_tag = self.config_pois_preparation[category].get("classify_by_tag")
@@ -284,7 +386,7 @@ class PoiPreparation:
                     df=df,
                     poi_config=config_by_tag[key],
                     key=key,
-                    new_column_names=new_column_names,
+                    new_column_names=new_column_names
                 )
 
         # Classify by name in list
@@ -544,7 +646,7 @@ class PoiPreparation:
         # Assigning the name to the subway entrance
         df_subway_entrances = (
             df_subway_entrances.with_columns(
-                pl.Series(name="new_name", values=name_to_assign, dtype=pl.Utf8)
+                pl.Series(name="new_name", values=name_to_assign, dtype=pl.Utf8,strict=False)
             )
             .with_columns(
                 pl.when(pl.col("new_name") != "nan")
@@ -710,7 +812,7 @@ class PoiPreparation:
             pl.when(
                 (pl.col("amenity") == "vending_machine")
                 & (pl.col("tags").map_elements(
-                    lambda tags: any(tag in tags for tag in ['food', 'bread', 'milk', 'eggs', 'meat', 'potato', 'honey', 'cheese']),
+                    lambda tags: any(tag in tags for tag in ['food', 'bread', 'milk', 'eggs', 'meat', 'potato', 'honey', 'cheese','drinks','sweets']),
                     return_dtype=pl.Boolean
                 ))
             )
@@ -719,18 +821,46 @@ class PoiPreparation:
             .alias("category")
         )
         classified_tags["amenity"].append("vending_machine")
-
         # classifies religious sites
         df = df.with_columns(
             pl.when(
-                ((pl.col("amenity") == "monastery") | (pl.col("amenity") == "place_of_worship"))
-                & (pl.col("tags").str.contains('wikidata'))
+            ((pl.col("amenity") == "monastery") | (pl.col("amenity") == "place_of_worship"))
+            & (pl.col("tags").str.contains('wikidata'))
             )
             .then(pl.lit("religious_site"))
             .otherwise(pl.col("category"))
             .alias("category")
         )
         classified_tags["amenity"].extend(["monastery", "place_of_worship"])
+
+        # classify swimming areas, water parks, swimming pools, and swimming sport as "freibad_oder_hallenbad"
+        df = df.with_columns(
+            pl.when(
+            (pl.col("leisure").is_in(["swimming_area", "water_park", "swimming_pool"]))
+            | (pl.col("sport") == "swimming")
+            )
+            .then(pl.lit("freibad_oder_hallenbad"))
+            .otherwise(pl.col("category"))
+            .alias("category")
+        )
+        classified_tags["leisure"].extend(["swimming_area", "water_park", "swimming_pool"])
+        classified_tags["sport"].extend("swimming")
+        
+        
+        # classifies young_center
+        df = df.with_columns(
+            pl.when(
+                (pl.col("amenity") == "community_center")
+                & (pl.col("tags").map_elements(
+                    lambda tags: any(tag in tags for tag in ['youth_centre']),
+                    return_dtype=pl.Boolean
+                ))
+            )
+            .then(pl.lit("youth_centre"))
+            .otherwise(pl.col("category"))
+            .alias("category")
+        )
+        classified_tags["amenity"].append("youth_centre")
 
         # Loop through config
         for key in self.config_pois_preparation:
@@ -777,9 +907,7 @@ class PoiPreparation:
         #             .otherwise(pl.col("category"))
         #             .alias("category")
         #         )
-
         return df
-
 
 def prepare_poi(region: str):
     """Prepare POI data for the region.
@@ -788,14 +916,26 @@ def prepare_poi(region: str):
         region (str): Region to prepare POI data for.
     """
 
+    # copy nuts data from raw database to local database
     db = Database(settings.LOCAL_DATABASE_URI)
+    db_rd = Database(settings.RAW_DATABASE_URI)
+    ogr2ogr_command = (
+            f"ogr2ogr -f 'PostgreSQL' "
+            f"PG:'host={db.db_config.host} dbname={db.db_config.path.replace('/', '')} user={db.db_config.user} password={db.db_config.password} port={db.db_config.port}' "
+            f"PG:'host={db_rd.db_config.host} dbname={db_rd.db_config.path.replace('/', '')} user={db_rd.db_config.user} password={db_rd.db_config.password} port={db_rd.db_config.port}' "
+            f'-nln nuts -overwrite -sql "SELECT * FROM nuts"'
+        )
+    try:
+        subprocess.run(ogr2ogr_command, shell=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print_error(f"Reference geometry data table copy failed: {e}")
 
-    if region == 'europe':
-
+    if region == 'europe': 
         create_table_sql = POITable(data_set_type='poi', schema_name = 'poi', data_set_name =f'osm_{region}').create_poi_table(table_type='standard')
         db.perform(create_table_sql)
 
         for loop_region in Config("poi", region).regions:
+           # 
             process_poi_preparation(db, loop_region)
 
             # Insert data from regional table into 'europe' table
@@ -826,6 +966,7 @@ def prepare_poi(region: str):
     print_info(f'Preparation of region {region} is finished.')
 
     db.conn.close()
+    db_rd.conn.close()
 
 def process_poi_preparation(db: Database, region: str):
     """Process POI preparation for a given region."""
@@ -833,7 +974,9 @@ def process_poi_preparation(db: Database, region: str):
 
     # Read and classify POI data
     df = poi_preparation.read_poi()
+    
     df = poi_preparation.classify_poi(df)
+    
 
     # Export raw data to local PostGIS
     engine = db.return_sqlalchemy_engine()
@@ -855,7 +998,7 @@ def process_poi_preparation(db: Database, region: str):
     # insert into our POI schema
     create_table_sql = POITable(data_set_type='poi', schema_name = 'public', data_set_name =f'osm_{region}').create_poi_table(table_type='standard')
     db.perform(create_table_sql)
-
+    
     insert_poi_osm_sql = f"""
         INSERT INTO public.poi_osm_{region}(category, name, operator, street, housenumber, zipcode, phone, email, website, capacity, opening_hours, wheelchair, source, tags, geom)
         SELECT
@@ -876,12 +1019,21 @@ def process_poi_preparation(db: Database, region: str):
                 (jsonb_build_object(
                     'origin', origin, 'organic', organic, 'subway', subway, 'amenity', amenity,
                     'shop', shop, 'tourism', tourism, 'railway', railway, 'leisure', leisure, 'sport', sport, 'highway',
-                    highway, 'public_transport', public_transport, 'historic', historic, 'brand', brand
+                    highway, 'public_transport', public_transport, 'historic', historic, 'building', building, 'brand', brand
                 ) || tags) || jsonb_build_object('extended_source', jsonb_build_object('osm_id', osm_id, 'osm_type', osm_type))
             )) AS tags,
-            geom
-        FROM public.poi_osm_{region}_raw
-    """
+            r.geom
+        FROM public.poi_osm_{region}_raw as r"""
+    if region != "europe":
+        insert_poi_osm_sql = (
+            insert_poi_osm_sql +
+            """
+            join public.nuts as nu
+            ON ST_Intersects(r.geom, nu.geom)
+            WHERE nu.levl_code = 0 AND nu.nuts_id = '{region_upper}'
+            """
+        ).format(region=region, region_upper=region.upper())
+    
     db.perform(insert_poi_osm_sql)
 
 def export_poi(region: str):
