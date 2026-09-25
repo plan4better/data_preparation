@@ -544,7 +544,7 @@ class PoiPreparation:
         # Assigning the name to the subway entrance
         df_subway_entrances = (
             df_subway_entrances.with_columns(
-                pl.Series(name="new_name", values=name_to_assign, dtype=pl.Utf8)
+                pl.Series(name="new_name", values=name_to_assign, dtype=pl.Utf8, strict=False)
             )
             .with_columns(
                 pl.when(pl.col("new_name") != "nan")
